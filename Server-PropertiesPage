@@ -1,0 +1,342 @@
+/**
+ * Complete API — Properties + Units + Images (S3) + Search + Notes
+ * Node.js + Express + MongoDB (Mongoose) + AWS S3
+ *
+ * Endpoints
+ *   GET    /              -> health
+ *   POST   /api/properties               -> create property (multipart, S3 images)
+ *   GET    /api/properties               -> list + search + pagination (optional ?userId=&q=)
+ *   GET    /api/properties/:id           -> get one
+ *   PATCH  /api/properties/:id/notes     -> add note (inspection|maintenance|marketing)
+ *   PATCH  /api/properties/:id/images/:imageKey/caption -> set image caption
+ *   POST   /api/properties/:id/units     -> create a unit (multipart, S3 images)
+ *   GET    /api/properties/:id/units     -> list units for a property
+ *   GET    /api/units/:unitId            -> get one unit
+ *
+ * Quick start
+ *   npm i express mongoose multer cors dotenv morgan @aws-sdk/client-s3
+ *   Create .env (see below) then: node server.js
+ *
+ * .env example
+ *   PORT=4000
+ *   MONGO_URI=mongodb://localhost:27017/pms
+ *   BASE_URL=http://localhost:4000
+ *   AWS_REGION=us-east-1
+ *   AWS_ACCESS_KEY_ID=YOUR_KEY
+ *   AWS_SECRET_ACCESS_KEY=YOUR_SECRET
+ *   S3_BUCKET=your-bucket-name
+ *   # Optional: CloudFront/custom domain for public URLs
+ *   # S3_PUBLIC_BASE=https://cdn.yourdomain.com
+ */
+
+const path = require('path');
+const express = require('express');
+const mongoose = require('mongoose');
+const multer = require('multer');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const morgan = require('morgan');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+dotenv.config();
+
+// --- Config ---
+const PORT = process.env.PORT || 4000;
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/pms';
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const AWS_REGION = process.env.AWS_REGION;
+const S3_BUCKET = process.env.S3_BUCKET;
+const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE; // optional CDN/base
+
+if (!AWS_REGION || !S3_BUCKET) {
+  console.warn('[WARN] Missing AWS_REGION or S3_BUCKET. Set them in .env for image upload.');
+}
+
+// Multer memory storage (buffers streamed to S3)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
+// --- DB ---
+mongoose
+  .connect(MONGO_URI, { autoIndex: true })
+  .then(() => console.log('Mongo connected'))
+  .catch((e) => { console.error('Mongo connection failed', e); process.exit(1); });
+
+const ImageSchema = new mongoose.Schema(
+  {
+    key: String,        // S3 object key
+    url: String,        // public URL
+    mimetype: String,
+    size: Number,
+    caption: { type: String }, // optional per-image caption/note
+  },
+  { _id: false }
+);
+
+const PropertySchema = new mongoose.Schema(
+  {
+    userId: { type: String, index: true, required: true }, // owner
+
+    title: { type: String },
+    address1: String,
+    address2: String,
+    city: String,
+    state: String,
+    zip: String,
+    country: { type: String, default: 'USA' },
+
+    propertyType: String,
+    status: String,
+    bedrooms: Number,
+    bathrooms: Number,
+    sqft: Number,
+    lotSqft: Number,
+    yearBuilt: String,
+    rent: Number,
+    deposit: Number,
+    availableOn: Date,
+
+    utilitiesIncluded: [String],
+    amenities: [String],
+    notes: String,
+
+    // Structured notes by category
+    inspectionNotes: [ { text: String, createdAt: { type: Date, default: Date.now }, authorId: String } ],
+    maintenanceNotes: [ { text: String, createdAt: { type: Date, default: Date.now }, authorId: String } ],
+    marketingNotes:   [ { text: String, createdAt: { type: Date, default: Date.now }, authorId: String } ],
+
+    images: [ImageSchema],
+
+    attributes: { type: Map, of: mongoose.Schema.Types.Mixed, default: undefined },
+
+    location: {
+      type: { type: String, enum: ['Point'], default: 'Point' },
+      coordinates: { type: [Number], default: undefined }, // [lng, lat]
+    },
+  },
+  { timestamps: true }
+);
+
+const UnitSchema = new mongoose.Schema(
+  {
+    userId: { type: String, index: true, required: true },
+    propertyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Property', index: true, required: true },
+
+    unitNumber: { type: String, required: true },
+    status: String,
+
+    bedrooms: Number,
+    bathrooms: Number,
+    sqft: Number,
+    rent: Number,
+    deposit: Number,
+    availableOn: Date,
+
+    images: [ImageSchema],
+    notes: String,
+
+    attributes: { type: Map, of: mongoose.Schema.Types.Mixed, default: undefined },
+  },
+  { timestamps: true }
+);
+
+PropertySchema.index({ createdAt: -1 });
+PropertySchema.index({ location: '2dsphere' }, { sparse: true });
+UnitSchema.index({ createdAt: -1 });
+UnitSchema.index({ userId: 1, propertyId: 1, unitNumber: 1 }, { unique: true });
+
+const Property = mongoose.model('Property', PropertySchema);
+const Unit = mongoose.model('Unit', UnitSchema);
+
+// --- App ---
+const app = express();
+app.use(cors());
+app.use(morgan('dev'));
+app.use(express.json({ limit: '5mb' }));
+
+// Health
+app.get('/', (_req, res) => res.json({ ok: true, version: '1.0.0' }));
+
+// --- AWS S3 Client ---
+const s3 = new S3Client({ region: AWS_REGION });
+
+// Helpers
+const toNumber = (v) => { if (v === undefined || v === null || v === '') return undefined; const n = Number(v); return Number.isNaN(n) ? undefined : n; };
+const toDate = (v) => (!v ? undefined : (isNaN(new Date(v).getTime()) ? undefined : new Date(v)));
+const toArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
+const publicUrlForKey = (key) => S3_PUBLIC_BASE ? `${S3_PUBLIC_BASE}/${key}` : `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+async function uploadBufferToS3({ buffer, key, contentType }) { const cmd = new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: contentType || 'application/octet-stream', ACL: 'public-read' }); await s3.send(cmd); return publicUrlForKey(key); }
+async function uploadFilesToS3(prefix, files = []) { const out = []; let i = 0; for (const f of files) { const ext = path.extname(f.originalname) || ''; const key = `${prefix}/images/${Date.now()}-${i++}${ext}`; const url = await uploadBufferToS3({ buffer: f.buffer, key, contentType: f.mimetype }); out.push({ key, url, mimetype: f.mimetype, size: f.size }); } return out; }
+
+// ---------------- Properties ----------------
+// Create Property
+app.post('/api/properties', upload.array('images'), async (req, res) => {
+  try {
+    const userId = req.header('x-user-id') || req.body.userId;
+    if (!userId) return res.status(400).json({ error: 'Missing userId (x-user-id or form field userId)' });
+
+    const b = req.body;
+    const _id = new mongoose.Types.ObjectId();
+
+    let attributes; if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (e) {} }
+    const images = await uploadFilesToS3(`${userId}/${_id.toString()}`, req.files || []);
+
+    const lat = toNumber(b.lat), lng = toNumber(b.lng);
+
+    const doc = new Property({
+      _id,
+      userId,
+      title: b.title?.trim(), address1: b.address1?.trim(), address2: b.address2?.trim(), city: b.city?.trim(), state: b.state?.trim(), zip: b.zip?.trim(), country: b.country?.trim() || 'USA',
+      propertyType: b.propertyType, status: b.status,
+      bedrooms: toNumber(b.bedrooms), bathrooms: toNumber(b.bathrooms), sqft: toNumber(b.sqft), lotSqft: toNumber(b.lotSqft), yearBuilt: b.yearBuilt,
+      rent: toNumber(b.rent), deposit: toNumber(b.deposit), availableOn: toDate(b.availableOn),
+      utilitiesIncluded: toArray(b['utilitiesIncluded[]'] ?? b.utilitiesIncluded),
+      amenities: toArray(b['amenities[]'] ?? b.amenities),
+      notes: b.notes,
+      images,
+      attributes,
+      location: lat !== undefined && lng !== undefined ? { type: 'Point', coordinates: [lng, lat] } : undefined,
+    });
+
+    const saved = await doc.save();
+    res.status(201).json(saved);
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message || 'Failed to create property' });
+  }
+});
+
+// List Properties with optional search (ANY string field) + pagination
+app.get('/api/properties', async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Number(req.query.limit) || 50;
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (req.query.userId) filter.userId = String(req.query.userId);
+
+    if (req.query.q) {
+      const search = new RegExp(req.query.q, 'i'); // case-insensitive
+      const stringFields = Object.keys(Property.schema.paths).filter((key) => Property.schema.paths[key].instance === 'String');
+      filter.$or = stringFields.map((field) => ({ [field]: search }));
+    }
+
+    const [items, total] = await Promise.all([
+      Property.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Property.countDocuments(filter),
+    ]);
+
+    res.json({ items, page, limit, total, hasMore: skip + items.length < total });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to list properties' });
+  }
+});
+
+// Get one Property
+app.get('/api/properties/:id', async (req, res) => {
+  try {
+    const item = await Property.findById(req.params.id);
+    if (!item) return res.status(404).json({ error: 'Not found' });
+    res.json(item);
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid id' });
+  }
+});
+
+// Add a property note
+app.patch('/api/properties/:id/notes', async (req, res) => {
+  try {
+    const { type = 'inspection', text, authorId } = req.body || {};
+    if (!text || !String(text).trim()) return res.status(400).json({ error: 'text is required' });
+    const fieldMap = { inspection: 'inspectionNotes', maintenance: 'maintenanceNotes', marketing: 'marketingNotes' };
+    const field = fieldMap[type] || fieldMap.inspection;
+    const update = { $push: { [field]: { text: String(text).trim(), authorId, createdAt: new Date() } } };
+    const result = await Property.findByIdAndUpdate(req.params.id, update, { new: true });
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Failed to add note' });
+  }
+});
+
+// Set/Update an image caption
+app.patch('/api/properties/:id/images/:imageKey/caption', async (req, res) => {
+  try {
+    const { caption } = req.body || {};
+    const propertyId = req.params.id;
+    const imageKey = decodeURIComponent(req.params.imageKey);
+
+    const updated = await Property.findOneAndUpdate(
+      { _id: propertyId, 'images.key': imageKey },
+      { $set: { 'images.$.caption': caption } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: 'Property or image not found' });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'Failed to update caption' });
+  }
+});
+
+// ---------------- Units ----------------
+// Create Unit
+app.post('/api/properties/:id/units', upload.array('images'), async (req, res) => {
+  try {
+    const userId = req.header('x-user-id') || req.body.userId;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    const propertyId = req.params.id;
+    const prop = await Property.findById(propertyId);
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+    if (String(prop.userId) !== String(userId)) return res.status(403).json({ error: 'Forbidden' });
+
+    const b = req.body;
+    if (!b.unitNumber || !String(b.unitNumber).trim()) return res.status(400).json({ error: 'unitNumber is required' });
+
+    const _id = new mongoose.Types.ObjectId();
+
+    let attributes; if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (e) {} }
+    const images = await uploadFilesToS3(`${userId}/${propertyId}/${_id.toString()}`, req.files || []);
+
+    const unit = new Unit({
+      _id, userId, propertyId,
+      unitNumber: String(b.unitNumber).trim(), status: b.status,
+      bedrooms: toNumber(b.bedrooms), bathrooms: toNumber(b.bathrooms), sqft: toNumber(b.sqft),
+      rent: toNumber(b.rent), deposit: toNumber(b.deposit), availableOn: toDate(b.availableOn),
+      notes: b.notes, images, attributes,
+    });
+
+    const saved = await unit.save();
+    res.status(201).json(saved);
+  } catch (err) {
+    if (err && err.code === 11000) return res.status(409).json({ error: 'Unit with this unitNumber already exists for this property' });
+    console.error(err);
+    res.status(400).json({ error: err.message || 'Failed to create unit' });
+  }
+});
+
+// List Units for property
+app.get('/api/properties/:id/units', async (req, res) => {
+  try {
+    const propertyId = req.params.id;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Number(req.query.limit) || 100;
+    const skip = (page - 1) * limit;
+    const [items, total] = await Promise.all([
+      Unit.find({ propertyId }).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Unit.countDocuments({ propertyId }),
+    ]);
+    res.json({ items, page, limit, total, hasMore: skip + items.length < total });
+  } catch (err) { res.status(500).json({ error: 'Failed to list units' }); }
+});
+
+// Get one Unit
+app.get('/api/units/:unitId', async (req, res) => {
+  try {
+    const item = await Unit.findById(req.params.unitId);
+    if (!item) return res.status(404).json({ error: 'Not found' });
+    res.json(item);
+  } catch (err) { res.status(400).json({ error: 'Invalid id' }); }
+});
+
+app.listen(PORT, () => console.log(`API running on ${BASE_URL}`));
