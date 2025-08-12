@@ -1,0 +1,32 @@
+// userScopePlugin.js
+// Auto-scopes all model queries to the current user (multi-tenant by default).
+
+module.exports = function userScopePlugin(schema) {
+  // Inject { userId: <currentUserId> } for all read operations
+  schema.pre(/^find/, function () {
+    const currentUserId = this.getOptions()?.currentUserId;
+    if (currentUserId) this.where({ userId: String(currentUserId) });
+  });
+
+  // Count operations should also be scoped
+  schema.pre('countDocuments', function () {
+    const currentUserId = this.getOptions()?.currentUserId;
+    if (currentUserId) this.where({ userId: String(currentUserId) });
+  });
+
+  // Guard updates so they only affect docs owned by current user
+  schema.pre(/^(findOneAndUpdate|updateOne|updateMany)$/, function () {
+    const currentUserId = this.getOptions()?.currentUserId;
+    if (currentUserId) {
+      this.setQuery({ userId: String(currentUserId), ...this.getQuery() });
+    }
+  });
+
+  // Aggregations: prepend a $match on userId
+  schema.pre('aggregate', function () {
+    const currentUserId = this.options?.currentUserId;
+    if (currentUserId) {
+      this.pipeline().unshift({ $match: { userId: String(currentUserId) } });
+    }
+  });
+};
