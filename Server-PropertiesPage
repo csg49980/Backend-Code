@@ -1,21 +1,24 @@
 /**
- * Complete API — Properties + Units + Images (S3) + Search + Notes
+ * PMS API — Properties + Units + Images (S3) + Search + Notes + Audit (Multi-tenant)
  * Node.js + Express + MongoDB (Mongoose) + AWS S3
  *
  * Endpoints
- *   GET    /              -> health
- *   POST   /api/properties               -> create property (multipart, S3 images)
- *   GET    /api/properties               -> list + search + pagination (optional ?userId=&q=)
- *   GET    /api/properties/:id           -> get one
- *   PATCH  /api/properties/:id/notes     -> add note (inspection|maintenance|marketing)
+ *   GET    /                                 -> health
+ *   POST   /api/properties                   -> create property (multipart, S3 images)
+ *   GET    /api/properties                   -> list + user-scoped search + pagination (?q=&page=&limit=)
+ *   GET    /api/properties/:id               -> get one (user-scoped)
+ *   PATCH  /api/properties/:id/notes         -> add note (inspection|maintenance|marketing)
  *   PATCH  /api/properties/:id/images/:imageKey/caption -> set image caption
- *   POST   /api/properties/:id/units     -> create a unit (multipart, S3 images)
- *   GET    /api/properties/:id/units     -> list units for a property
- *   GET    /api/units/:unitId            -> get one unit
+ *   POST   /api/properties/:id/units         -> create a unit (multipart, S3 images)
+ *   GET    /api/properties/:id/units         -> list units for a property (user-scoped)
+ *   GET    /api/units/:unitId                -> get one unit (user-scoped)
+ *   GET    /api/audit                        -> list audit logs (user-scoped, filters + pagination)
+ *   GET    /api/properties/:id/audit         -> audit logs for a property (user-scoped)
+ *   GET    /api/units/:unitId/audit          -> audit logs for a unit (user-scoped)
  *
  * Quick start
  *   npm i express mongoose multer cors dotenv morgan @aws-sdk/client-s3
- *   Create .env (see below) then: node server.js
+ *   Create .env then: node server.js
  *
  * .env example
  *   PORT=4000
@@ -25,7 +28,7 @@
  *   AWS_ACCESS_KEY_ID=YOUR_KEY
  *   AWS_SECRET_ACCESS_KEY=YOUR_SECRET
  *   S3_BUCKET=your-bucket-name
- *   # Optional: CloudFront/custom domain for public URLs
+ *   # Optional CDN/CloudFront for public URLs
  *   # S3_PUBLIC_BASE=https://cdn.yourdomain.com
  */
 
@@ -37,6 +40,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const morgan = require('morgan');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const userScopePlugin = require('./userScopePlugin');
 
 dotenv.config();
 
@@ -53,13 +57,18 @@ if (!AWS_REGION || !S3_BUCKET) {
 }
 
 // Multer memory storage (buffers streamed to S3)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+});
 
 // --- DB ---
 mongoose
   .connect(MONGO_URI, { autoIndex: true })
   .then(() => console.log('Mongo connected'))
-  .catch((e) => { console.error('Mongo connection failed', e); process.exit(1); });
+  .catch((mongoConnectionError) => { console.error('Mongo connection failed', mongoConnectionError); process.exit(1); });
+
+// ---------- Schemas & Models ----------
 
 const ImageSchema = new mongoose.Schema(
   {
@@ -72,9 +81,21 @@ const ImageSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const AuditSubSchema = new mongoose.Schema(
+  {
+    createdByUserId: { type: String },
+    updatedByUserId: { type: String },
+    createdFromIp:   { type: String },
+    updatedFromIp:   { type: String },
+    createdUserAgent:{ type: String },
+    updatedUserAgent:{ type: String },
+  },
+  { _id: false }
+);
+
 const PropertySchema = new mongoose.Schema(
   {
-    userId: { type: String, index: true, required: true }, // owner
+    userId: { type: String, index: true, required: true }, // tenant owner
 
     title: { type: String },
     address1: String,
@@ -105,13 +126,14 @@ const PropertySchema = new mongoose.Schema(
     marketingNotes:   [ { text: String, createdAt: { type: Date, default: Date.now }, authorId: String } ],
 
     images: [ImageSchema],
-
     attributes: { type: Map, of: mongoose.Schema.Types.Mixed, default: undefined },
 
     location: {
       type: { type: String, enum: ['Point'], default: 'Point' },
       coordinates: { type: [Number], default: undefined }, // [lng, lat]
     },
+
+    audit: AuditSubSchema,
   },
   { timestamps: true }
 );
@@ -135,23 +157,96 @@ const UnitSchema = new mongoose.Schema(
     notes: String,
 
     attributes: { type: Map, of: mongoose.Schema.Types.Mixed, default: undefined },
+
+    audit: AuditSubSchema,
   },
   { timestamps: true }
 );
 
+// Tenant-friendly indexes for speed
+PropertySchema.index({ userId: 1, createdAt: -1 });
+PropertySchema.index({ userId: 1, _id: 1 });
+PropertySchema.index({ userId: 1, city: 1 });
+PropertySchema.index({ userId: 1, status: 1 });
 PropertySchema.index({ createdAt: -1 });
 PropertySchema.index({ location: '2dsphere' }, { sparse: true });
+
+UnitSchema.index({ userId: 1, propertyId: 1, createdAt: -1 });
+UnitSchema.index({ userId: 1, _id: 1 });
 UnitSchema.index({ createdAt: -1 });
 UnitSchema.index({ userId: 1, propertyId: 1, unitNumber: 1 }, { unique: true });
+
+// Optional: user-scoped text index for faster search (choose fields you want searchable)
+PropertySchema.index(
+  { userId: 1, title: 'text', address1: 'text', address2: 'text', city: 'text', state: 'text', notes: 'text' },
+  { name: 'property_user_text' }
+);
+
+// Plug in user scope (multi-tenant by default)
+PropertySchema.plugin(userScopePlugin);
+UnitSchema.plugin(userScopePlugin);
 
 const Property = mongoose.model('Property', PropertySchema);
 const Unit = mongoose.model('Unit', UnitSchema);
 
-// --- App ---
+const AuditLogSchema = new mongoose.Schema({
+  timestamp:   { type: Date, default: Date.now, index: true },
+  userId:      { type: String, index: true },
+  ip:          String,
+  userAgent:   String,
+  action:      { type: String, index: true },   // 'PROPERTY_CREATE', etc.
+  resource:    { type: String, index: true },   // 'Property' | 'Unit'
+  resourceId:  { type: String, index: true },   // ObjectId as string
+  route:       String,
+  method:      String,
+});
+AuditLogSchema.index({ resource: 1, resourceId: 1, timestamp: -1 });
+const AuditLog = mongoose.model('AuditLog', AuditLogSchema);
+
+// ---------- App ----------
 const app = express();
+
+// Make sure req.ip works correctly behind reverse proxies / load balancers
+app.set('trust proxy', true);
+
 app.use(cors());
-app.use(morgan('dev'));
+app.use(morgan(':date[iso] :remote-addr :method :url :status :res[content-length] - :response-time ms'));
 app.use(express.json({ limit: '5mb' }));
+
+// Request context: resolve userId, ip, userAgent for stamping/audit
+app.use((req, _res, next) => {
+  const userIdFromHeader = req.header('x-user-id'); // (swap to real auth later)
+  const xff = (req.headers['x-forwarded-for'] || '').toString();
+  const forwardedIp = xff.split(',')[0].trim();
+  const clientIp   = forwardedIp || req.ip || req.connection?.remoteAddress || 'unknown';
+  const userAgent  = req.headers['user-agent'] || 'unknown';
+  req.context = { userId: userIdFromHeader ? String(userIdFromHeader) : null, ip: clientIp, userAgent };
+  next();
+});
+
+// Require a resolved user context on routes
+function requireUser() {
+  return (req, res, next) => {
+    if (!req.context?.userId) return res.status(401).json({ error: 'Missing or invalid user context' });
+    req.currentUserId = req.context.userId;
+    next();
+  };
+}
+
+// Append-only audit logger
+async function logAudit(req, { action, resource, resourceId }) {
+  const { userId, ip, userAgent } = req.context || {};
+  try {
+    await AuditLog.create({
+      userId, ip, userAgent,
+      action, resource, resourceId,
+      route: req.originalUrl,
+      method: req.method,
+    });
+  } catch (e) {
+    console.error('[AuditLog] failed:', e?.message || e);
+  }
+}
 
 // Health
 app.get('/', (_req, res) => res.json({ ok: true, version: '1.0.0' }));
@@ -159,45 +254,119 @@ app.get('/', (_req, res) => res.json({ ok: true, version: '1.0.0' }));
 // --- AWS S3 Client ---
 const s3 = new S3Client({ region: AWS_REGION });
 
-// Helpers
-const toNumber = (v) => { if (v === undefined || v === null || v === '') return undefined; const n = Number(v); return Number.isNaN(n) ? undefined : n; };
-const toDate = (v) => (!v ? undefined : (isNaN(new Date(v).getTime()) ? undefined : new Date(v)));
-const toArray = (x) => (Array.isArray(x) ? x : x ? [x] : []);
-const publicUrlForKey = (key) => S3_PUBLIC_BASE ? `${S3_PUBLIC_BASE}/${key}` : `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
-async function uploadBufferToS3({ buffer, key, contentType }) { const cmd = new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: contentType || 'application/octet-stream', ACL: 'public-read' }); await s3.send(cmd); return publicUrlForKey(key); }
-async function uploadFilesToS3(prefix, files = []) { const out = []; let i = 0; for (const f of files) { const ext = path.extname(f.originalname) || ''; const key = `${prefix}/images/${Date.now()}-${i++}${ext}`; const url = await uploadBufferToS3({ buffer: f.buffer, key, contentType: f.mimetype }); out.push({ key, url, mimetype: f.mimetype, size: f.size }); } return out; }
+// ---------- Helpers ----------
+
+/** Convert input to number or undefined (handles "", null, invalid) */
+const toNumber = (valueMaybeNumber) => {
+  if (valueMaybeNumber === undefined || valueMaybeNumber === null || valueMaybeNumber === '') return undefined;
+  const coerced = Number(valueMaybeNumber);
+  return Number.isNaN(coerced) ? undefined : coerced;
+};
+
+/** Convert input to valid Date or undefined (rejects invalid dates) */
+const toDate = (dateInput) => {
+  if (!dateInput) return undefined;
+  const parsed = new Date(dateInput);
+  return isNaN(parsed.getTime()) ? undefined : parsed;
+};
+
+/** Normalize into array (form-data can be single or multi) */
+const toArray = (inputMaybeArray) => (Array.isArray(inputMaybeArray) ? inputMaybeArray : inputMaybeArray ? [inputMaybeArray] : []);
+
+/** Build a public URL for an S3 object key */
+const publicUrlForKey = (key) =>
+  S3_PUBLIC_BASE ? `${S3_PUBLIC_BASE}/${key}` : `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+
+/** Upload a raw Buffer to S3 and return the public URL */
+async function uploadBufferToS3({ buffer, key, contentType }) {
+  const command = new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType || 'application/octet-stream',
+    ACL: 'public-read',
+  });
+  await s3.send(command);
+  return publicUrlForKey(key);
+}
+
+/** Upload many Multer files to S3 under a prefix folder; return metadata array */
+async function uploadFilesToS3(prefix, files = []) {
+  const uploadedImages = [];
+  let index = 0;
+
+  for (const file of files) {
+    const ext = path.extname(file.originalname) || '';
+    const key = `${prefix}/images/${Date.now()}-${index++}${ext}`;
+    const url = await uploadBufferToS3({
+      buffer: file.buffer,
+      key,
+      contentType: file.mimetype,
+    });
+    uploadedImages.push({ key, url, mimetype: file.mimetype, size: file.size });
+  }
+
+  return uploadedImages;
+}
 
 // ---------------- Properties ----------------
-// Create Property
-app.post('/api/properties', upload.array('images'), async (req, res) => {
-  try {
-    const userId = req.header('x-user-id') || req.body.userId;
-    if (!userId) return res.status(400).json({ error: 'Missing userId (x-user-id or form field userId)' });
 
+// Create Property (user-scoped)
+app.post('/api/properties', requireUser(), upload.array('images'), async (req, res) => {
+  try {
+    const currentUserId = req.currentUserId;
     const b = req.body;
     const _id = new mongoose.Types.ObjectId();
 
-    let attributes; if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (e) {} }
-    const images = await uploadFilesToS3(`${userId}/${_id.toString()}`, req.files || []);
+    let attributes;
+    if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (_) {} }
 
+    const images = await uploadFilesToS3(`${currentUserId}/${_id.toString()}`, req.files || []);
     const lat = toNumber(b.lat), lng = toNumber(b.lng);
 
     const doc = new Property({
       _id,
-      userId,
-      title: b.title?.trim(), address1: b.address1?.trim(), address2: b.address2?.trim(), city: b.city?.trim(), state: b.state?.trim(), zip: b.zip?.trim(), country: b.country?.trim() || 'USA',
-      propertyType: b.propertyType, status: b.status,
-      bedrooms: toNumber(b.bedrooms), bathrooms: toNumber(b.bathrooms), sqft: toNumber(b.sqft), lotSqft: toNumber(b.lotSqft), yearBuilt: b.yearBuilt,
-      rent: toNumber(b.rent), deposit: toNumber(b.deposit), availableOn: toDate(b.availableOn),
+      userId: currentUserId, // enforce tenant ownership
+      title: b.title?.trim(),
+      address1: b.address1?.trim(),
+      address2: b.address2?.trim(),
+      city: b.city?.trim(),
+      state: b.state?.trim(),
+      zip: b.zip?.trim(),
+      country: b.country?.trim() || 'USA',
+
+      propertyType: b.propertyType,
+      status: b.status,
+      bedrooms: toNumber(b.bedrooms),
+      bathrooms: toNumber(b.bathrooms),
+      sqft: toNumber(b.sqft),
+      lotSqft: toNumber(b.lotSqft),
+      yearBuilt: b.yearBuilt,
+      rent: toNumber(b.rent),
+      deposit: toNumber(b.deposit),
+      availableOn: toDate(b.availableOn),
+
       utilitiesIncluded: toArray(b['utilitiesIncluded[]'] ?? b.utilitiesIncluded),
       amenities: toArray(b['amenities[]'] ?? b.amenities),
+
       notes: b.notes,
       images,
       attributes,
       location: lat !== undefined && lng !== undefined ? { type: 'Point', coordinates: [lng, lat] } : undefined,
+
+      audit: {
+        createdByUserId: currentUserId,
+        updatedByUserId: currentUserId,
+        createdFromIp:   req.context.ip,
+        updatedFromIp:   req.context.ip,
+        createdUserAgent:req.context.userAgent,
+        updatedUserAgent:req.context.userAgent,
+      },
     });
 
     const saved = await doc.save();
+    await logAudit(req, { action: 'PROPERTY_CREATE', resource: 'Property', resourceId: saved._id.toString() });
+
     res.status(201).json(saved);
   } catch (err) {
     console.error(err);
@@ -205,37 +374,46 @@ app.post('/api/properties', upload.array('images'), async (req, res) => {
   }
 });
 
-// List Properties with optional search (ANY string field) + pagination
-app.get('/api/properties', async (req, res) => {
+// List Properties (user-scoped search + pagination)
+app.get('/api/properties', requireUser(), async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Number(req.query.limit) || 50;
+    const limit = Math.min(200, Number(req.query.limit) || 50);
     const skip = (page - 1) * limit;
 
-    const filter = {};
-    if (req.query.userId) filter.userId = String(req.query.userId);
+    const q = String(req.query.q || '').trim();
+    let filter = {};
 
-    if (req.query.q) {
-      const search = new RegExp(req.query.q, 'i'); // case-insensitive
-      const stringFields = Object.keys(Property.schema.paths).filter((key) => Property.schema.paths[key].instance === 'String');
-      filter.$or = stringFields.map((field) => ({ [field]: search }));
+    if (q) {
+      // Prefer text search if index exists — else fallback to regex across string fields
+      filter = { $text: { $search: q } };
     }
 
+    const query = Property.find(filter)
+      .sort(q ? { score: { $meta: 'textScore' } } : { createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .setOptions({ currentUserId: req.currentUserId }); // <-- user scope
+
+    if (q) query.select({ score: { $meta: 'textScore' } });
+
     const [items, total] = await Promise.all([
-      Property.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
-      Property.countDocuments(filter),
+      query,
+      Property.countDocuments(filter).setOptions({ currentUserId: req.currentUserId }),
     ]);
 
     res.json({ items, page, limit, total, hasMore: skip + items.length < total });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Failed to list properties' });
   }
 });
 
-// Get one Property
-app.get('/api/properties/:id', async (req, res) => {
+// Get one Property (user-scoped)
+app.get('/api/properties/:id', requireUser(), async (req, res) => {
   try {
-    const item = await Property.findById(req.params.id);
+    const item = await Property.findById(req.params.id)
+      .setOptions({ currentUserId: req.currentUserId });
     if (!item) return res.status(404).json({ error: 'Not found' });
     res.json(item);
   } catch (err) {
@@ -243,35 +421,65 @@ app.get('/api/properties/:id', async (req, res) => {
   }
 });
 
-// Add a property note
-app.patch('/api/properties/:id/notes', async (req, res) => {
+// Add a property note (user-scoped)
+app.patch('/api/properties/:id/notes', requireUser(), async (req, res) => {
   try {
+    const currentUserId = req.currentUserId;
     const { type = 'inspection', text, authorId } = req.body || {};
     if (!text || !String(text).trim()) return res.status(400).json({ error: 'text is required' });
+
     const fieldMap = { inspection: 'inspectionNotes', maintenance: 'maintenanceNotes', marketing: 'marketingNotes' };
     const field = fieldMap[type] || fieldMap.inspection;
-    const update = { $push: { [field]: { text: String(text).trim(), authorId, createdAt: new Date() } } };
-    const result = await Property.findByIdAndUpdate(req.params.id, update, { new: true });
+
+    const update = {
+      $push: { [field]: { text: String(text).trim(), authorId, createdAt: new Date() } },
+      $set: {
+        'audit.updatedByUserId': currentUserId,
+        'audit.updatedFromIp':   req.context.ip,
+        'audit.updatedUserAgent':req.context.userAgent,
+      }
+    };
+
+    const result = await Property.findOneAndUpdate(
+      { _id: req.params.id },
+      update,
+      { new: true }
+    ).setOptions({ currentUserId }); // <-- enforce ownership
+
     if (!result) return res.status(404).json({ error: 'Not found' });
+
+    await logAudit(req, { action: 'PROPERTY_NOTE_ADD', resource: 'Property', resourceId: req.params.id });
+
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message || 'Failed to add note' });
   }
 });
 
-// Set/Update an image caption
-app.patch('/api/properties/:id/images/:imageKey/caption', async (req, res) => {
+// Update an image caption (user-scoped)
+app.patch('/api/properties/:id/images/:imageKey/caption', requireUser(), async (req, res) => {
   try {
+    const currentUserId = req.currentUserId;
     const { caption } = req.body || {};
-    const propertyId = req.params.id;
     const imageKey = decodeURIComponent(req.params.imageKey);
 
     const updated = await Property.findOneAndUpdate(
-      { _id: propertyId, 'images.key': imageKey },
-      { $set: { 'images.$.caption': caption } },
+      { _id: req.params.id, 'images.key': imageKey },
+      {
+        $set: {
+          'images.$.caption': caption,
+          'audit.updatedByUserId': currentUserId,
+          'audit.updatedFromIp':   req.context.ip,
+          'audit.updatedUserAgent':req.context.userAgent,
+        }
+      },
       { new: true }
-    );
+    ).setOptions({ currentUserId });
+
     if (!updated) return res.status(404).json({ error: 'Property or image not found' });
+
+    await logAudit(req, { action: 'PROPERTY_IMAGE_CAPTION_UPDATE', resource: 'Property', resourceId: req.params.id });
+
     res.json(updated);
   } catch (err) {
     res.status(400).json({ error: err.message || 'Failed to update caption' });
@@ -279,64 +487,177 @@ app.patch('/api/properties/:id/images/:imageKey/caption', async (req, res) => {
 });
 
 // ---------------- Units ----------------
-// Create Unit
-app.post('/api/properties/:id/units', upload.array('images'), async (req, res) => {
-  try {
-    const userId = req.header('x-user-id') || req.body.userId;
-    if (!userId) return res.status(400).json({ error: 'Missing userId' });
 
-    const propertyId = req.params.id;
-    const prop = await Property.findById(propertyId);
-    if (!prop) return res.status(404).json({ error: 'Property not found' });
-    if (String(prop.userId) !== String(userId)) return res.status(403).json({ error: 'Forbidden' });
+// Create Unit (user-scoped, parent ownership enforced by plugin)
+app.post('/api/properties/:id/units', requireUser(), upload.array('images'), async (req, res) => {
+  try {
+    const currentUserId = req.currentUserId;
+
+    // Ensure parent property belongs to this user
+    const parent = await Property.findById(req.params.id)
+      .setOptions({ currentUserId });
+    if (!parent) return res.status(404).json({ error: 'Property not found' });
 
     const b = req.body;
-    if (!b.unitNumber || !String(b.unitNumber).trim()) return res.status(400).json({ error: 'unitNumber is required' });
+    if (!b.unitNumber || !String(b.unitNumber).trim())
+      return res.status(400).json({ error: 'unitNumber is required' });
 
     const _id = new mongoose.Types.ObjectId();
 
-    let attributes; if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (e) {} }
-    const images = await uploadFilesToS3(`${userId}/${propertyId}/${_id.toString()}`, req.files || []);
+    let attributes; if (b.attributes) { try { attributes = JSON.parse(b.attributes); } catch (_) {} }
+
+    const images = await uploadFilesToS3(`${currentUserId}/${parent._id.toString()}/${_id.toString()}`, req.files || []);
 
     const unit = new Unit({
-      _id, userId, propertyId,
-      unitNumber: String(b.unitNumber).trim(), status: b.status,
-      bedrooms: toNumber(b.bedrooms), bathrooms: toNumber(b.bathrooms), sqft: toNumber(b.sqft),
-      rent: toNumber(b.rent), deposit: toNumber(b.deposit), availableOn: toDate(b.availableOn),
-      notes: b.notes, images, attributes,
+      _id,
+      userId: currentUserId,               // enforce owner
+      propertyId: parent._id,
+      unitNumber: String(b.unitNumber).trim(),
+      status: b.status,
+      bedrooms: toNumber(b.bedrooms),
+      bathrooms: toNumber(b.bathrooms),
+      sqft: toNumber(b.sqft),
+      rent: toNumber(b.rent),
+      deposit: toNumber(b.deposit),
+      availableOn: toDate(b.availableOn),
+      notes: b.notes,
+      images,
+      attributes,
+      audit: {
+        createdByUserId: currentUserId,
+        updatedByUserId: currentUserId,
+        createdFromIp:   req.context.ip,
+        updatedFromIp:   req.context.ip,
+        createdUserAgent:req.context.userAgent,
+        updatedUserAgent:req.context.userAgent,
+      },
     });
 
     const saved = await unit.save();
+    await logAudit(req, { action: 'UNIT_CREATE', resource: 'Unit', resourceId: saved._id.toString() });
+
     res.status(201).json(saved);
   } catch (err) {
-    if (err && err.code === 11000) return res.status(409).json({ error: 'Unit with this unitNumber already exists for this property' });
+    if (err && err.code === 11000)
+      return res.status(409).json({ error: 'Unit with this unitNumber already exists for this property' });
     console.error(err);
     res.status(400).json({ error: err.message || 'Failed to create unit' });
   }
 });
 
-// List Units for property
-app.get('/api/properties/:id/units', async (req, res) => {
+// List Units for a property (user-scoped)
+app.get('/api/properties/:id/units', requireUser(), async (req, res) => {
   try {
-    const propertyId = req.params.id;
+    const currentUserId = req.currentUserId;
+
+    const parent = await Property.findById(req.params.id)
+      .setOptions({ currentUserId });
+    if (!parent) return res.status(404).json({ error: 'Property not found' });
+
     const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Number(req.query.limit) || 100;
+    const limit = Math.min(200, Number(req.query.limit) || 100);
     const skip = (page - 1) * limit;
+
     const [items, total] = await Promise.all([
-      Unit.find({ propertyId }).sort({ createdAt: -1 }).skip(skip).limit(limit),
-      Unit.countDocuments({ propertyId }),
+      Unit.find({ propertyId: parent._id })
+        .sort({ createdAt: -1 }).skip(skip).limit(limit)
+        .setOptions({ currentUserId }),
+      Unit.countDocuments({ propertyId: parent._id })
+        .setOptions({ currentUserId }),
     ]);
+
     res.json({ items, page, limit, total, hasMore: skip + items.length < total });
   } catch (err) { res.status(500).json({ error: 'Failed to list units' }); }
 });
 
-// Get one Unit
-app.get('/api/units/:unitId', async (req, res) => {
+// Get one Unit (user-scoped)
+app.get('/api/units/:unitId', requireUser(), async (req, res) => {
   try {
-    const item = await Unit.findById(req.params.unitId);
+    const item = await Unit.findById(req.params.unitId)
+      .setOptions({ currentUserId: req.currentUserId });
     if (!item) return res.status(404).json({ error: 'Not found' });
     res.json(item);
   } catch (err) { res.status(400).json({ error: 'Invalid id' }); }
 });
 
+// ---------------- Audit Log Queries (user-scoped) ----------------
+
+/**
+ * GET /api/audit
+ * Query params:
+ *  - resource: "Property" | "Unit"   (optional)
+ *  - resourceId: string              (optional)
+ *  - action: string                  (optional)
+ *  - from: ISO date                  (optional)
+ *  - to: ISO date                    (optional)
+ *  - page: number (default 1)
+ *  - limit: number (default 50, max 200)
+ *  - sort: "asc" | "desc" (default "desc")
+ */
+app.get('/api/audit', requireUser(), async (req, res) => {
+  try {
+    const {
+      resource,
+      resourceId,
+      action,
+      from,
+      to,
+      page: pageStr,
+      limit: limitStr,
+      sort: sortOrder = 'desc',
+    } = req.query;
+
+    const page = Math.max(1, Number(pageStr) || 1);
+    const limit = Math.min(200, Number(limitStr) || 50);
+    const skip = (page - 1) * limit;
+
+    const filter = { userId: req.currentUserId }; // user-scoped
+
+    if (resource)   filter.resource   = String(resource);
+    if (resourceId) filter.resourceId = String(resourceId);
+    if (action)     filter.action     = String(action);
+
+    // date range filter on timestamp
+    const fromDate = toDate(from);
+    const toDateVal = toDate(to);
+    if (fromDate || toDateVal) {
+      filter.timestamp = {};
+      if (fromDate)   filter.timestamp.$gte = fromDate;
+      if (toDateVal)  filter.timestamp.$lte = toDateVal;
+    }
+
+    const sort = { timestamp: sortOrder === 'asc' ? 1 : -1 };
+
+    const [items, total] = await Promise.all([
+      AuditLog.find(filter).sort(sort).skip(skip).limit(limit),
+      AuditLog.countDocuments(filter),
+    ]);
+
+    res.json({
+      items,
+      page,
+      limit,
+      total,
+      hasMore: skip + items.length < total,
+    });
+  } catch (err) {
+    console.error('[AuditQuery] error:', err);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+// Convenience aliases (user-scoped via /api/audit handler)
+app.get('/api/properties/:id/audit', requireUser(), async (req, res) => {
+  req.query.resource = 'Property';
+  req.query.resourceId = req.params.id;
+  return app._router.handle(req, res, () => {}, 'GET', '/api/audit');
+});
+
+app.get('/api/units/:unitId/audit', requireUser(), async (req, res) => {
+  req.query.resource = 'Unit';
+  req.query.resourceId = req.params.unitId;
+  return app._router.handle(req, res, () => {}, 'GET', '/api/audit');
+});
+
+// --------------- Start ---------------
 app.listen(PORT, () => console.log(`API running on ${BASE_URL}`));
